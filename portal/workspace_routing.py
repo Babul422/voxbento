@@ -14,8 +14,9 @@ from portal.utils import safe_redirect
 WORKSPACE_PREFIX = "/workspace"
 ADMIN_PREFIX = "/admin"
 _EVENT_PATH_RE = re.compile(r"^/(?:api/)?admin(?:/api)?/events/(?P<event_id>\d+)(?:/|$)")
+# "/workspace/" itself is "My events" (#766), served by its own route for every
+# signed-in user, so it is not mapped onto the admin dashboard.
 _WORKSPACE_ROUTE_PATTERNS = (
-    re.compile(r"/workspace/?"),
     re.compile(r"/workspace/events/?"),
     re.compile(r"/workspace/setup/?"),
     re.compile(r"/workspace/events/\d+/?"),
@@ -25,6 +26,7 @@ _WORKSPACE_ROUTE_PATTERNS = (
     re.compile(r"/workspace/events/\d+/rooms/\d+(?:/(?:transcripts|edit|delete))?/?"),
     re.compile(r"/workspace/events/by-slug/[^/]+/rooms/[^/]+/?"),
     re.compile(r"/workspace/events/by-slug/[^/]+/rooms/by-eventyay/[^/]+/?"),
+    re.compile(r"/workspace/events/\d+/rooms/\d+/ai-vocabulary/(?:upload|export|delete)/?"),
     re.compile(r"/workspace/events/\d+/rooms/\d+/(?:program-ingest|program-relay|meeting-source)"),
     re.compile(r"/workspace/events/\d+/rooms/\d+/members(?:/\d+/(?:invite|delete))?/?"),
     re.compile(r"/workspace/events/\d+/rooms/\d+/booths/?"),
@@ -58,6 +60,8 @@ def workspace_to_admin_path(path: str) -> str | None:
 
 def legacy_admin_to_workspace_path(path: str) -> str | None:
     """Return the organizer equivalent of a legacy management path."""
+    if path in (ADMIN_PREFIX, f"{ADMIN_PREFIX}/"):
+        return f"{WORKSPACE_PREFIX}/"
     if path == ADMIN_PREFIX or path.startswith(f"{ADMIN_PREFIX}/"):
         workspace_path = f"{WORKSPACE_PREFIX}{path[len(ADMIN_PREFIX) :]}"
     elif path.startswith("/api/admin/"):

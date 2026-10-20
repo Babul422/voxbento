@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,13 +35,11 @@ from portal.database import (
     create_hosting_request,
     create_user,
     get_auth_token,
+    get_developer_account,
     get_open_hosting_request,
     get_session,
     get_user_by_email,
     get_user_by_id,
-    list_booth_memberships_for_user,
-    list_memberships_for_user,
-    list_room_memberships_for_user,
     redeem_auth_token,
     redeem_invite_token,
     revoke_auth_token,
@@ -54,15 +53,18 @@ from portal.email import (
     send_verification_email,
 )
 from portal.email_sender import send_delayed_onboarding_email
-from portal.globals import _JS_CACHE_BUST
+from portal.globals import _JS_CACHE_BUST, asset_version_context
 from portal.hosting_requests import format_event_dates, parse_hosting_request_form
 from portal.models import HOSTING_REQUEST_GRANTED, TOKEN_TYPE_HOSTING_INVITE, AuthToken, User, utc_now
 from portal.rate_limit import check_rate_limit
 from portal.schemas.auth import TokenRequest, TokenResponse
+from portal.user_menu import resolve_user_menu, user_menu_context
 from portal.utils import safe_redirect, verify_same_origin
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
-templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
+templates = Jinja2Templates(
+    directory=str(_BASE_DIR / "templates"), context_processors=[user_menu_context, asset_version_context]
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -414,7 +416,7 @@ async def request_magic_link(request: Request):
     import hashlib
     import secrets
     import time
-    from datetime import datetime, timedelta, timezone
+    from datetime import timedelta
 
     from fastapi.responses import JSONResponse
 
@@ -507,7 +509,6 @@ async def poll_magic_link(request: Request, poll_id: str = ""):
         return {"authenticated": False}
 
     # 2. Reject expired magic-link tokens before issuing a JWT
-    from datetime import datetime, timezone
 
     now_utc = datetime.now(timezone.utc)
     exp = poll_entry.get("expires_at")
@@ -740,8 +741,20 @@ async def user_logout(request: Request, next: str = "/"):
     return response
 
 
+ACCOUNT_NOTICES = {
+    "hosting_request_sent": "hosting_request_sent",
+    "profile_saved": "Your display name was saved.",
+    "password_changed": "Your password was changed.",
+    "password_set": "Your password was set. You can now sign in with it or with an email link.",
+    "password_removed": "Your password was removed. Sign in with a link sent to your email from now on.",
+}
+DISPLAY_NAME_MAX = 200
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
 @router.get("/account")
 async def account_page(request: Request):
+    """The person's profile, access (hosting, developer API) and sign-in settings (#767)."""
     current_user = await get_current_user(request)
     if current_user is None:
         return safe_redirect(url="/login", status_code=status.HTTP_303_SEE_OTHER)
@@ -752,93 +765,48 @@ async def account_page(request: Request):
             response = safe_redirect(url="/login", status_code=status.HTTP_303_SEE_OTHER)
             response.delete_cookie("user_token")
             return response
-        event_memberships = await list_memberships_for_user(session, user.id)
-        room_memberships = await list_room_memberships_for_user(session, user.id)
-        booth_memberships = await list_booth_memberships_for_user(session, user.id)
         open_hosting_request = await get_open_hosting_request(session, user.id)
+        developer_account = await get_developer_account(session, user.id)
+    await resolve_user_menu(request)
 
-    unified_memberships = []
-    coordinated_event_slugs = {
-        m.room.event_id: m.room.event.slug
-        for m in room_memberships
-        if m.role == "room_coordinator" and m.room and m.room.event
-    }
-    has_owned_events = any(m.role == "event_owner" for m in event_memberships)
-    is_hosting_revoked = bool(user.hosting_revoked_at is not None)
-
-    for m in event_memberships:
-        is_disabled = False
-        if m.event is None:
-            link = "#"
-        elif m.role == "event_owner":
-            link = f"/workspace/events/{m.event.id}/"
-        elif m.event_id in coordinated_event_slugs:
-            link = f"/mission-control/{coordinated_event_slugs[m.event_id]}/"
-        else:
-            link = "#"
-        unified_memberships.append(
-            {
-                "context": m.event.display_name if m.event else "—",
-                "link": link,
-                "type": "Event",
-                "role": m.role,
-                "created_at": m.created_at,
-                "is_disabled": is_disabled,
-            }
-        )
-    for m in room_memberships:
-        context_str = (
-            f"{m.room.event.display_name} - {m.room.display_name}"
-            if m.room and m.room.event
-            else (m.room.display_name if m.room else "—")
-        )
-        link_str = f"/mission-control/{m.room.event.slug}/" if m.room and m.room.event else "#"
-        unified_memberships.append(
-            {"context": context_str, "link": link_str, "type": "Room", "role": m.role, "created_at": m.created_at}
-        )
-    for m in booth_memberships:
-        context_str = (
-            f"{m.booth.event.display_name} - {m.booth.room.display_name} - {m.booth.language_name}"
-            if m.booth and m.booth.event and m.booth.room
-            else "—"
-        )
-        link_str = (
-            f"/interpreter/{m.booth.event.slug}/{m.booth.room_id}/{m.booth.language_code}"
-            if m.booth and m.booth.event
-            else "#"
-        )
-        unified_memberships.append(
-            {"context": context_str, "link": link_str, "type": "Booth", "role": m.role, "created_at": m.created_at}
-        )
-
-    unified_memberships.sort(key=lambda x: x["created_at"] or datetime.min.replace(tzinfo=timezone.utc))
-
-    if user.is_admin:
-        management_home = "/admin/"
-        management_label = "Admin Panel"
-    elif user.can_host or has_owned_events:
-        management_home = "/workspace/"
-        management_label = "Organizer Workspace"
-    elif any(m.role == "room_coordinator" for m in room_memberships):
-        management_home = "/mission-control/"
-        management_label = "Mission Control"
-    else:
-        management_home = "/account"
-        management_label = "My Account"
-
+    success = request.query_params.get("success", "")
     return templates.TemplateResponse(
         request=request,
         name="account.html",
         context={
             "user": user,
-            "memberships": unified_memberships,
-            "management_home": management_home,
-            "management_label": management_label,
-            "is_hosting_revoked": is_hosting_revoked,
+            "is_hosting_revoked": user.hosting_revoked_at is not None,
             "open_hosting_request": open_hosting_request,
-            "hosting_request_sent": request.query_params.get("success") == "hosting_request_sent",
+            "developer_account": developer_account,
+            "hosting_request_sent": success == "hosting_request_sent",
+            "notice": ACCOUNT_NOTICES.get(success) if success != "hosting_request_sent" else None,
+            "error": request.query_params.get("error", ""),
+            "display_name_max": DISPLAY_NAME_MAX,
         },
     )
+
+
+@router.post("/account/profile")
+async def update_profile(request: Request):
+    """Change the signed-in person's display name."""
+    if not verify_same_origin(request):
+        raise HTTPException(status_code=400, detail="Invalid request origin.")
+    current_user = await get_current_user(request)
+    if current_user is None:
+        return safe_redirect(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+
+    form = await request.form()
+    raw = form.get("display_name")
+    display_name = " ".join(raw.split()) if isinstance(raw, str) else ""
+    if not display_name or len(display_name) > DISPLAY_NAME_MAX or _CONTROL_CHARS.search(display_name):
+        return safe_redirect(url="/account?error=display_name", status_code=status.HTTP_303_SEE_OTHER)
+
+    async with get_session() as session:
+        user = await get_user_by_id(session, int(current_user["sub"]))
+        if user is None:
+            return safe_redirect(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+        user.display_name = display_name
+    return safe_redirect(url="/account?success=profile_saved", status_code=status.HTTP_303_SEE_OTHER)
 
 
 HOSTING_REQUEST_PATH = "/account/hosting-request"
@@ -937,14 +905,22 @@ async def submit_hosting_request(request: Request):
 async def set_password_api(request: Request):
     user_token = await require_user(request)
     data = await request.json()
-    password = data.get("password", "")
+    password = data.get("password", "") if isinstance(data, dict) else ""
+    current_password = data.get("current_password", "") if isinstance(data, dict) else ""
 
-    if len(password) < 8:
+    if not isinstance(password, str) or len(password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
     async with get_session() as session:
-        pw_hash = hash_password(password)
-        await update_user(session, int(user_token["sub"]), password_hash=pw_hash)
+        user = await get_user_by_id(session, int(user_token["sub"]))
+        if user is None:
+            raise HTTPException(status_code=400, detail="User not found")
+        # Changing an existing password needs the current one; setting a first password does not.
+        if user.password_hash and not (
+            isinstance(current_password, str) and verify_password(current_password, user.password_hash)
+        ):
+            raise HTTPException(status_code=403, detail="Your current password is not correct")
+        await update_user(session, user.id, password_hash=hash_password(password))
 
     return {"status": "ok"}
 
@@ -953,17 +929,18 @@ async def set_password_api(request: Request):
 async def remove_password_api(request: Request):
     user_token = await require_user(request)
     data = await request.json()
-    password = data.get("password", "")
+    password = data.get("password", "") if isinstance(data, dict) else ""
 
     async with get_session() as session:
         user = await get_user_by_id(session, int(user_token["sub"]))
         if not user or not user.password_hash:
-            raise HTTPException(status_code=400, detail="User has no password")
+            raise HTTPException(status_code=400, detail="You don't have a password to remove")
 
-        if not verify_password(password, user.password_hash):
-            raise HTTPException(status_code=403, detail="Invalid password")
+        if not isinstance(password, str) or not verify_password(password, user.password_hash):
+            raise HTTPException(status_code=403, detail="Your current password is not correct")
 
-        await update_user(session, user.id, password_hash=None)
+        # Set directly: update_user() treats None as "leave unchanged".
+        user.password_hash = None
 
     return {"status": "ok"}
 

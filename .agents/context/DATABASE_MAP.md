@@ -279,6 +279,16 @@ user. Handled requests are kept for the record. `users.hosting_requested_at` mir
 the open request's creation time and is cleared when it is handled; the homepage demo
 form no longer sets it.
 
+## Migration 031 — AI interpretation settings and vocabulary entries (#639)
+
+Room fields: `floor_ai_interpreter_persona` (Text, nullable), `floor_ai_interpretation_style`
+(Text, nullable), `floor_ai_vocabulary_enabled` (Boolean, default true).
+Table `ai_vocabulary_entries`: indexed glossary terms scoped to event, room, or booth.
+Fields: `id`, `event_id`, `room_id` (nullable), `booth_id` (nullable), `source_term` (String(255)),
+`target_language` (String(20), default `all`), `target_term` (String(255)), `description` (Text),
+`case_sensitive` (Boolean, default false), `match_type` (String(20), `phrase` default | `exact`),
+`priority` (Integer, default 0), `created_at`. Scopes cascade on delete.
+
 ## Migration 028 — RTMPS relay mode (#749)
 
 Room fields: `program_ingest_mode` (`whip` default | `rtmps_relay`; binds the program

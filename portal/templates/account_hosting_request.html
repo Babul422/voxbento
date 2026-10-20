@@ -5,9 +5,17 @@
 {% block body_class %} class="account-area"{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/auth.css') }}" />
-<link rel="stylesheet" href="{{ url_for('static', path='css/account-area.css') }}" />
+<link rel="stylesheet" href="{{ url_for('static', path='css/auth.css') }}?v={{ asset_version }}" />
+<link rel="stylesheet" href="{{ url_for('static', path='css/account-area.css') }}?v={{ asset_version }}" />
+<link rel="stylesheet" href="{{ url_for('static', path='css/app-header.css') }}?v={{ asset_version }}" />
+<script type="module" src="{{ url_for('static', path='js/user-menu.js') }}?v={{ asset_version }}"></script>
 {% endblock %}
+
+{% block header %}
+{% from "_app_header.html" import app_header with context %}
+{{ app_header() }}
+{% endblock %}
+
 
 {% macro field_error(name) -%}
   {% if errors.get(name) %}
@@ -20,7 +28,6 @@
 {%- endmacro %}
 
 {% block content %}
-{% include "_account_header.html" %}
 
 <div class="aa-page">
   <nav class="aa-breadcrumb" aria-label="Breadcrumb">
