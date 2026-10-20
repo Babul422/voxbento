@@ -1124,7 +1124,7 @@ async def revoke_api_key(session: AsyncSession, key_id: int, event_id: int) -> b
     stmt = select(EventAPIKey).where(EventAPIKey.id == key_id, EventAPIKey.event_id == event_id)
     result = await session.execute(stmt)
     key = result.scalar_one_or_none()
-    if key:
+    if key and key.active:
         key.active = False
         await session.flush()
         return True

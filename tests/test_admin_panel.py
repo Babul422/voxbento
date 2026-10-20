@@ -1903,6 +1903,12 @@ class TestAPIKeyCRUD:
             # Revoke key
             res_del = await c.delete(f"/workspace/api/events/{event_id}/api-keys/{key_id}")
             assert res_del.status_code == 200
+            assert res_del.json() == {"success": True}
+
+            # Repeated revoke of the same key returns 404
+            res_del_again = await c.delete(f"/workspace/api/events/{event_id}/api-keys/{key_id}")
+            assert res_del_again.status_code == 404
+            assert res_del_again.json()["detail"] == "API Key not found or already revoked"
 
             # List keys (should be empty again)
             res = await c.get(f"/workspace/api/events/{event_id}/api-keys")
