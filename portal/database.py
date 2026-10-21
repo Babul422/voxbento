@@ -1088,15 +1088,21 @@ async def save_transcript_segment(booth_id_str: str, text: str, room_id: int | N
     from portal.models import DBBooth, Event
 
     parts = booth_id_str.split("-")
-    if len(parts) < 3:
-        # Fallback for floor or invalid
-        language_code = parts[-1] if parts else "floor"
-        event_slug = "-".join(parts[:-1]) if len(parts) > 1 else ""
-        parsed_room_id = room_id
-    else:
+    if len(parts) >= 3 and parts[-2].isdigit():
         language_code = parts[-1]
         parsed_room_id = int(parts[-2])
         event_slug = "-".join(parts[:-2])
+    elif len(parts) >= 2 and parts[-1] == "floor":
+        # Legacy floor format: {event_slug}-floor (requires explicit room_id fallback)
+        language_code = "floor"
+        parsed_room_id = room_id
+        event_slug = "-".join(parts[:-1])
+    else:
+        # Malformed identifier (e.g. non-floor ID without numeric room ID)
+        return None
+
+    if parsed_room_id is None:
+        return None
 
     try:
         async with get_session() as session:
@@ -1113,7 +1119,9 @@ async def save_transcript_segment(booth_id_str: str, text: str, room_id: int | N
                 )
                 booth_id = await session.scalar(stmt)
 
-            segment = TranscriptSegment(room_id=room_id, booth_id=booth_id, language_code=language_code, text=text)
+            segment = TranscriptSegment(
+                room_id=parsed_room_id, booth_id=booth_id, language_code=language_code, text=text
+            )
             session.add(segment)
             await session.flush()
             return segment.id
