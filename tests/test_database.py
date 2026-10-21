@@ -1538,7 +1538,9 @@ class TestSaveTranscriptSegment:
 
     @pytest.mark.anyio
     async def test_malformed_middle_segment(self):
-        """A 3-part ID with non-digit middle segment falls back to room_id or returns None."""
+        """A 3-part ID with non-digit middle segment is safely rejected even with explicit room_id."""
+        from sqlalchemy import func, select
+
         from portal.database import create_event, create_room, get_session
         from portal.models import TranscriptSegment
 
@@ -1551,15 +1553,15 @@ class TestSaveTranscriptSegment:
         res_none = await save_transcript_segment(f"{event_slug}-notanumber-floor", "Audio", room_id=None)
         assert res_none is None
 
-        # With explicit room_id fallback: uses room_id and saves successfully
-        seg_id = await save_transcript_segment(f"{event_slug}-notanumber-floor", "Audio", room_id=room_id)
-        assert seg_id is not None
+        # With explicit room_id: malformed floor ID is also safely rejected
+        res_explicit = await save_transcript_segment(f"{event_slug}-notanumber-floor", "Audio", room_id=room_id)
+        assert res_explicit is None
 
+        # Verify no segment was created for the rejected input
         async with get_session() as session:
-            seg = await session.get(TranscriptSegment, seg_id)
-            assert seg is not None
-            assert seg.room_id == room_id
-            assert seg.language_code == "floor"
+            stmt = select(func.count(TranscriptSegment.id)).where(TranscriptSegment.room_id == room_id)
+            count = await session.scalar(stmt)
+            assert count == 0
 
     @pytest.mark.anyio
     async def test_malformed_non_floor_id_returns_none(self):
@@ -1579,3 +1581,131 @@ class TestSaveTranscriptSegment:
         # With explicit room_id: malformed non-floor ID is rejected rather than constructing a false event slug
         res_explicit = await save_transcript_segment(f"{event_slug}-notanumber-es", "Hola", room_id=room_id)
         assert res_explicit is None
+
+    @pytest.mark.anyio
+    async def test_floor_legacy_event_slug_ending_in_digits_explicit_room_id(self):
+        """Legacy floor ID whose event slug ends in digits resolves correctly with explicit room_id."""
+        from portal.database import create_event, create_room, get_session
+        from portal.models import TranscriptSegment
+
+        async with get_session() as session:
+            event = await create_event(session, slug="summit-2026", display_name="Summit 2026")
+            room = await create_room(session, event_id=event.id, display_name="Plenary")
+            event_slug, room_id = event.slug, room.id
+
+        # summit-2026-floor should be recognized as legacy floor ID for room_id, not canonical room 2026
+        seg_id = await save_transcript_segment(f"{event_slug}-floor", "Floor audio", room_id=room_id)
+        assert seg_id is not None
+
+        async with get_session() as session:
+            seg = await session.get(TranscriptSegment, seg_id)
+            assert seg is not None
+            assert seg.room_id == room_id
+            assert seg.booth_id is None
+            assert seg.language_code == "floor"
+
+    @pytest.mark.anyio
+    async def test_floor_legacy_event_slug_ending_in_digits_omitted_room_id_returns_none(self):
+        """Legacy floor ID whose event slug ends in digits returns None when room_id is omitted."""
+        from portal.database import create_event, create_room, get_session
+
+        async with get_session() as session:
+            event = await create_event(session, slug="summit-2026", display_name="Summit 2026")
+            await create_room(session, event_id=event.id, display_name="Plenary")
+            event_slug = event.slug
+
+        # Omitted room_id: cannot be resolved as legacy floor ID; room 2026 does not exist for "summit"
+        res = await save_transcript_segment(f"{event_slug}-floor", "Floor audio", room_id=None)
+        assert res is None
+
+    @pytest.mark.anyio
+    async def test_floor_canonical_event_slug_ending_in_digits(self):
+        """Canonical floor ID whose event slug ends in digits resolves room_id correctly."""
+        from portal.database import create_event, create_room, get_session
+        from portal.models import TranscriptSegment
+
+        async with get_session() as session:
+            event = await create_event(session, slug="summit-2026", display_name="Summit 2026")
+            room = await create_room(session, event_id=event.id, display_name="Room B")
+            event_slug, room_id = event.slug, room.id
+
+        # Canonical format: summit-2026-{room_id}-floor
+        seg_id = await save_transcript_segment(f"{event_slug}-{room_id}-floor", "Canonical floor text")
+        assert seg_id is not None
+
+        async with get_session() as session:
+            seg = await session.get(TranscriptSegment, seg_id)
+            assert seg is not None
+            assert seg.room_id == room_id
+            assert seg.language_code == "floor"
+
+    @pytest.mark.anyio
+    async def test_unicode_digit_like_room_id_returns_none(self):
+        """Unicode digit-like room characters (e.g. '²') return None safely without ValueError."""
+        from portal.database import create_booth, create_event, create_room, get_session
+
+        async with get_session() as session:
+            event = await create_event(session, slug="pycon-berlin", display_name="PyCon Berlin")
+            room = await create_room(session, event_id=event.id, display_name="Main Hall")
+            await create_booth(session, event_id=event.id, room_id=room.id, language_code="es", language_name="Spanish")
+            event_slug, room_id = event.slug, room.id
+
+        # Non-floor ID with Unicode superscript digit
+        res1 = await save_transcript_segment(f"{event_slug}-²-es", "Hola", room_id=None)
+        assert res1 is None
+
+        res2 = await save_transcript_segment(f"{event_slug}-²-es", "Hola", room_id=room_id)
+        assert res2 is None
+
+        # Floor ID with Unicode superscript digit
+        res3 = await save_transcript_segment(f"{event_slug}-²-floor", "Floor", room_id=None)
+        assert res3 is None
+
+        res4 = await save_transcript_segment(f"{event_slug}-²-floor", "Floor", room_id=room_id)
+        assert res4 is None
+
+    @pytest.mark.anyio
+    async def test_case_normalization_resolves_consistently(self):
+        """Uppercase/mixed-case identifiers are normalized and resolve consistently."""
+        from portal.database import create_booth, create_event, create_room, get_session
+        from portal.models import TranscriptSegment
+
+        async with get_session() as session:
+            event = await create_event(session, slug="pycon-berlin", display_name="PyCon Berlin")
+            room = await create_room(session, event_id=event.id, display_name="Main Hall")
+            booth = await create_booth(
+                session, event_id=event.id, room_id=room.id, language_code="es", language_name="Spanish"
+            )
+            event_slug, room_id, booth_id = event.slug, room.id, booth.id
+
+        # 1. Canonical language booth with uppercase language code
+        seg1 = await save_transcript_segment(f"{event_slug}-{room_id}-ES", "Texto en español")
+        assert seg1 is not None
+
+        async with get_session() as session:
+            record1 = await session.get(TranscriptSegment, seg1)
+            assert record1 is not None
+            assert record1.room_id == room_id
+            assert record1.booth_id == booth_id
+            assert record1.language_code == "es"
+
+        # 2. Canonical floor ID with uppercase FLOOR
+        seg2 = await save_transcript_segment(f"{event_slug}-{room_id}-FLOOR", "Floor uppercase audio")
+        assert seg2 is not None
+
+        async with get_session() as session:
+            record2 = await session.get(TranscriptSegment, seg2)
+            assert record2 is not None
+            assert record2.room_id == room_id
+            assert record2.booth_id is None
+            assert record2.language_code == "floor"
+
+        # 3. Legacy floor ID with mixed-case Floor
+        seg3 = await save_transcript_segment(f"{event_slug}-Floor", "Legacy mixed audio", room_id=room_id)
+        assert seg3 is not None
+
+        async with get_session() as session:
+            record3 = await session.get(TranscriptSegment, seg3)
+            assert record3 is not None
+            assert record3.room_id == room_id
+            assert record3.language_code == "floor"
