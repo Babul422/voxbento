@@ -2258,7 +2258,10 @@ HOSTING_REQUESTS_URL = "/admin/hosting-access/requests/"
 def hosting_return_url(request: Request, default: str, query: str, user_id: int | None = None) -> str:
     """Send hosting actions taken from the Hosting access or User detail page back to it."""
     referrer = request.headers.get("referer", "")
-    ref_path = urllib.parse.urlsplit(referrer).path if referrer else ""
+    try:
+        ref_path = urllib.parse.urlsplit(referrer).path if referrer else ""
+    except ValueError:
+        ref_path = ""
     if user_id is not None and ref_path == f"/admin/users/{user_id}/":
         base = f"/admin/users/{user_id}/"
     elif ref_path == HOSTING_ACCESS_URL:
