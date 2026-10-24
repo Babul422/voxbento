@@ -176,75 +176,117 @@ async def test_my_booths_audio_controls_do_not_overflow_card(setup_db, viewport_
             async with asyncio.timeout(10.0):
                 async with websockets.connect(ws_url, open_timeout=3.0) as ws:
                     cmd_id = 0
+                    pending_commands: dict[int, asyncio.Future] = {}
+                    lifecycle_load_events: dict[str, asyncio.Event] = {}
 
-                    async def send(method, params=None):
-                        nonlocal cmd_id
-                        cmd_id += 1
-                        cur = cmd_id
-                        await ws.send(json.dumps({"id": cur, "method": method, "params": params or {}}))
-                        while True:
-                            resp = json.loads(await ws.recv())
-                            if resp.get("id") == cur:
-                                return resp.get("result")
+                    def get_loader_event(loader_id: str) -> asyncio.Event:
+                        if loader_id not in lifecycle_load_events:
+                            lifecycle_load_events[loader_id] = asyncio.Event()
+                        return lifecycle_load_events[loader_id]
 
-                    await send(
-                        "Emulation.setDeviceMetricsOverride",
-                        {
-                            "width": viewport_width,
-                            "height": viewport_height,
-                            "deviceScaleFactor": 1,
-                            "mobile": False,
-                        },
-                    )
-                    await send("Page.navigate", {"url": f"file://{html_file}"})
-                    await asyncio.sleep(0.4)
+                    async def reader():
+                        try:
+                            async for raw in ws:
+                                msg = json.loads(raw)
+                                if "id" in msg:
+                                    fut = pending_commands.pop(msg["id"], None)
+                                    if fut and not fut.done():
+                                        if "error" in msg:
+                                            fut.set_exception(
+                                                RuntimeError(f"CDP command {msg['id']} failed: {msg['error']}")
+                                            )
+                                        else:
+                                            fut.set_result(msg.get("result"))
+                                elif msg.get("method") == "Page.lifecycleEvent":
+                                    params = msg.get("params", {})
+                                    if params.get("name") == "load" and params.get("loaderId"):
+                                        get_loader_event(params["loaderId"]).set()
+                        except (websockets.ConnectionClosed, asyncio.CancelledError):
+                            for fut in pending_commands.values():
+                                if not fut.done():
+                                    fut.cancel()
+                        except Exception as e:
+                            for fut in pending_commands.values():
+                                if not fut.done():
+                                    fut.set_exception(e)
 
-                    res = await send(
-                        "Runtime.evaluate",
-                        {
-                            "expression": f"""(() => {{
-                                const card = document.querySelector('.lobby-check');
-                                const select = document.querySelector('#mic-device-select');
-                                const btn = document.querySelector('#mic-test-btn');
-                                if (!card || !select || !btn) {{
-                                    return {{ error: 'elements not found' }};
-                                }}
-                                const cr = card.getBoundingClientRect();
-                                const sr = select.getBoundingClientRect();
-                                const br = btn.getBoundingClientRect();
-                                const vw = {viewport_width};
-                                const selectedText = select.options[select.selectedIndex]?.text || '';
-                                return {{
-                                    cardRight: cr.right,
-                                    cardWidth: cr.width,
-                                    selectLeft: sr.left,
-                                    selectRight: sr.right,
-                                    selectWidth: sr.width,
-                                    btnLeft: br.left,
-                                    btnRight: br.right,
-                                    btnWidth: br.width,
-                                    selectedText: selectedText,
-                                    hasLongLabel: selectedText.includes("Extremely Long"),
-                                    cardInsideViewport: cr.right <= vw + 0.5,
-                                    selectInsideCard: sr.left >= cr.left - 0.5 && sr.right <= cr.right + 0.5,
-                                    btnInsideCard: br.left >= cr.left - 0.5 && br.right <= cr.right + 0.5,
-                                    btnInsideViewport: br.right <= vw + 0.5,
-                                    btnToRightOfSelect: sr.right <= br.left + 0.5,
-                                    btnVisibleAndReadable: br.width >= 40
-                                }};
-                            }})()""",
-                            "returnByValue": True,
-                        },
-                    )
-                    metrics = res["result"]["value"]
-                    assert "error" not in metrics, metrics.get("error")
-                    assert metrics["hasLongLabel"], f"Long label not found in select: {metrics}"
-                    assert metrics["cardInsideViewport"], f"Card expanded past viewport: {metrics}"
-                    assert metrics["selectInsideCard"], f"Select overflows card: {metrics}"
-                    assert metrics["btnInsideCard"], f"Test button overflows card: {metrics}"
-                    assert metrics["btnInsideViewport"], f"Test button overflows viewport: {metrics}"
-                    assert metrics["btnToRightOfSelect"], f"Test button overlaps select: {metrics}"
-                    assert metrics["btnVisibleAndReadable"], f"Test button shrunk too small: {metrics}"
+                    reader_task = asyncio.create_task(reader())
+                    try:
+                        async def send(method, params=None):
+                            nonlocal cmd_id
+                            cmd_id += 1
+                            cur = cmd_id
+                            loop = asyncio.get_running_loop()
+                            fut = loop.create_future()
+                            pending_commands[cur] = fut
+                            await ws.send(json.dumps({"id": cur, "method": method, "params": params or {}}))
+                            return await fut
+
+                        await send("Page.enable")
+                        await send("Page.setLifecycleEventsEnabled", {"enabled": True})
+                        await send(
+                            "Emulation.setDeviceMetricsOverride",
+                            {
+                                "width": viewport_width,
+                                "height": viewport_height,
+                                "deviceScaleFactor": 1,
+                                "mobile": False,
+                            },
+                        )
+                        nav = await send("Page.navigate", {"url": f"file://{html_file}"})
+                        loader_id = nav.get("loaderId") if isinstance(nav, dict) else None
+                        assert loader_id, f"Page.navigate did not return loaderId: {nav}"
+                        await get_loader_event(loader_id).wait()
+
+                        res = await send(
+                            "Runtime.evaluate",
+                            {
+                                "expression": f"""(() => {{
+                                    const card = document.querySelector('.lobby-check');
+                                    const select = document.querySelector('#mic-device-select');
+                                    const btn = document.querySelector('#mic-test-btn');
+                                    if (!card || !select || !btn) {{
+                                        return {{ error: 'elements not found' }};
+                                    }}
+                                    const cr = card.getBoundingClientRect();
+                                    const sr = select.getBoundingClientRect();
+                                    const br = btn.getBoundingClientRect();
+                                    const vw = {viewport_width};
+                                    const selectedText = select.options[select.selectedIndex]?.text || '';
+                                    return {{
+                                        cardRight: cr.right,
+                                        cardWidth: cr.width,
+                                        selectLeft: sr.left,
+                                        selectRight: sr.right,
+                                        selectWidth: sr.width,
+                                        btnLeft: br.left,
+                                        btnRight: br.right,
+                                        btnWidth: br.width,
+                                        selectedText: selectedText,
+                                        hasLongLabel: selectedText.includes("Extremely Long"),
+                                        cardInsideViewport: cr.right <= vw + 0.5,
+                                        selectInsideCard: sr.left >= cr.left - 0.5 && sr.right <= cr.right + 0.5,
+                                        btnInsideCard: br.left >= cr.left - 0.5 && br.right <= cr.right + 0.5,
+                                        btnInsideViewport: br.right <= vw + 0.5,
+                                        btnToRightOfSelect: sr.right <= br.left + 0.5,
+                                        btnVisibleAndReadable: br.width >= 40
+                                    }};
+                                }})()""",
+                                "returnByValue": True,
+                            },
+                        )
+                        metrics = res["result"]["value"]
+                        assert "error" not in metrics, metrics.get("error")
+                        assert metrics["hasLongLabel"], f"Long label not found in select: {metrics}"
+                        assert metrics["cardInsideViewport"], f"Card expanded past viewport: {metrics}"
+                        assert metrics["selectInsideCard"], f"Select overflows card: {metrics}"
+                        assert metrics["btnInsideCard"], f"Test button overflows card: {metrics}"
+                        assert metrics["btnInsideViewport"], f"Test button overflows viewport: {metrics}"
+                        assert metrics["btnToRightOfSelect"], f"Test button overlaps select: {metrics}"
+                        assert metrics["btnVisibleAndReadable"], f"Test button shrunk too small: {metrics}"
+                    finally:
+                        reader_task.cancel()
+                        await asyncio.gather(reader_task, return_exceptions=True)
         finally:
             if proc.poll() is None:
                 proc.terminate()
