@@ -182,8 +182,14 @@ async def wait_for_devtools_active_port(
                 except OSError:
                     pass
             elif hasattr(proc, "communicate"):
-                _, stderr = proc.communicate()
-                stderr_msg = stderr.decode(errors="replace").strip()
+                try:
+                    _, stderr = proc.communicate()
+                    if isinstance(stderr, bytes):
+                        stderr_msg = stderr.decode(errors="replace").strip()
+                    elif isinstance(stderr, str):
+                        stderr_msg = stderr.strip()
+                except Exception:
+                    pass
             raise RuntimeError(
                 f"Chrome exited prematurely (exit code {proc.returncode}): {stderr_msg}"
             )
@@ -218,25 +224,36 @@ async def wait_for_devtools_active_port(
         except OSError:
             pass
     elif hasattr(proc, "communicate"):
-        _, stderr = proc.communicate()
-        stderr_msg = stderr.decode(errors="replace").strip()
+        try:
+            _, stderr = proc.communicate()
+            if isinstance(stderr, bytes):
+                stderr_msg = stderr.decode(errors="replace").strip()
+            elif isinstance(stderr, str):
+                stderr_msg = stderr.strip()
+        except Exception:
+            pass
 
     err_suffix = f": {stderr_msg}" if stderr_msg else ""
     raise TimeoutError(f"Failed to read valid DevToolsActivePort from Chrome within {timeout}s timeout{err_suffix}")
 
 
-def rewrite_css_links(html: str, static_dir: Path | PurePath | str = STATIC_CSS_DIR) -> str:
-    """Rewrite static CSS links to absolute file:// URLs using normalized POSIX paths."""
-    if hasattr(static_dir, "resolve"):
-        try:
-            p = static_dir.resolve()
-        except OSError:
-            p = static_dir
+def to_file_uri(file_path: Path | PurePath | str) -> str:
+    """Convert a local file path to an absolute file:// URI valid across platforms."""
+    if isinstance(file_path, (PurePath, Path)):
+        p = file_path
     else:
-        p = Path(static_dir)
+        p = Path(file_path)
+    if hasattr(p, "resolve"):
+        try:
+            p = p.resolve()
+        except OSError:
+            pass
+    return p.as_uri()
 
-    posix_path = p.as_posix().lstrip("/")
-    base_file_url = f"file:///{posix_path}"
+
+def rewrite_css_links(html: str, static_dir: Path | PurePath | str = STATIC_CSS_DIR) -> str:
+    """Rewrite static CSS links to absolute file:// URLs using normalized paths."""
+    base_file_url = to_file_uri(static_dir).rstrip("/")
     return re.sub(
         r'href=["\'][^"\']*/static/css/([^"\'?]+)(?:\?[^"\']*)?["\']',
         lambda m: f'href="{base_file_url}/{m.group(1)}"',
@@ -305,7 +322,8 @@ async def render_and_evaluate_webkit(
             browser = await p.webkit.launch(headless=True)
             try:
                 page = await browser.new_page(viewport={"width": viewport_width, "height": viewport_height})
-                await page.goto(f"file://{html_file}", wait_until="load")
+                html_uri = to_file_uri(html_file)
+                await page.goto(html_uri, wait_until="load")
 
                 # WebKit on Linux enforces strict cross-directory file:// security boundaries,
                 # blocking external <link rel="stylesheet"> files stored outside the HTML file's directory.
@@ -371,9 +389,10 @@ async def render_and_evaluate_webkit(
                     f"/session/{session_id}/window/rect",
                     json={"width": viewport_width, "height": viewport_height},
                 )
+                html_uri = to_file_uri(html_file)
                 await http.post(
                     f"/session/{session_id}/url",
-                    json={"url": f"file://{html_file}"},
+                    json={"url": html_uri},
                 )
                 style_res = await http.post(
                     f"/session/{session_id}/execute/sync",
@@ -569,14 +588,14 @@ def test_parse_devtools_active_port():
 
 
 class _MockProc:
-    def __init__(self, returncode: int | None = None, stderr: bytes = b"") -> None:
+    def __init__(self, returncode: int | None = None, stderr: bytes | str | None = b"") -> None:
         self.returncode = returncode
         self._stderr = stderr
 
     def poll(self) -> int | None:
         return self.returncode
 
-    def communicate(self) -> tuple[bytes, bytes]:
+    def communicate(self) -> tuple[Any, Any]:
         return b"", self._stderr
 
     def terminate(self) -> None:
@@ -597,8 +616,24 @@ async def test_wait_for_devtools_active_port_premature_exit():
 
 
 @pytest.mark.anyio
+async def test_wait_for_devtools_active_port_premature_exit_none_stderr():
+    mock_proc = _MockProc(returncode=1, stderr=None)
+    with pytest.raises(RuntimeError, match="Chrome exited prematurely"):
+        await wait_for_devtools_active_port("/nonexistent/port", mock_proc, timeout=0.5, poll_interval=0.01)
+
+
+@pytest.mark.anyio
 async def test_wait_for_devtools_active_port_timeout(tmp_path: Path):
     mock_proc = _MockProc(returncode=None)
+    port_file = tmp_path / "DevToolsActivePort"
+    port_file.write_text("partial_only\n", encoding="utf-8")
+    with pytest.raises(TimeoutError, match="Failed to read valid DevToolsActivePort"):
+        await wait_for_devtools_active_port(port_file, mock_proc, timeout=0.05, poll_interval=0.01)
+
+
+@pytest.mark.anyio
+async def test_wait_for_devtools_active_port_timeout_none_stderr(tmp_path: Path):
+    mock_proc = _MockProc(returncode=None, stderr=None)
     port_file = tmp_path / "DevToolsActivePort"
     port_file.write_text("partial_only\n", encoding="utf-8")
     with pytest.raises(TimeoutError, match="Failed to read valid DevToolsActivePort"):
@@ -620,6 +655,23 @@ async def test_wait_for_devtools_active_port_success(tmp_path: Path):
     assert ws_path == "/devtools/browser/test-path"
 
 
+def test_to_file_uri_posix_and_windows(tmp_path: Path):
+    test_file = tmp_path / "interpreter.html"
+    test_file.write_text("<html></html>", encoding="utf-8")
+    uri_posix = to_file_uri(test_file)
+    assert uri_posix.startswith("file:///")
+    assert uri_posix.endswith("/interpreter.html")
+    assert "\\" not in uri_posix
+
+    uri_str = to_file_uri(str(test_file))
+    assert uri_str == uri_posix
+
+    win_path = PureWindowsPath(r"C:\Users\runneradmin\app\interpreter.html")
+    uri_win = to_file_uri(win_path)
+    assert uri_win == "file:///C:/Users/runneradmin/app/interpreter.html"
+    assert "\\" not in uri_win
+
+
 def test_rewrite_css_links_windows_and_posix():
     sample_html = (
         '<link rel="stylesheet" href="/static/css/lobby.css?v=20261025">'
@@ -627,7 +679,7 @@ def test_rewrite_css_links_windows_and_posix():
     )
     # Default STATIC_CSS_DIR
     rewritten_default = rewrite_css_links(sample_html)
-    expected_default = f"file:///{STATIC_CSS_DIR.resolve().as_posix().lstrip('/')}"
+    expected_default = to_file_uri(STATIC_CSS_DIR).rstrip("/")
     assert f'href="{expected_default}/lobby.css"' in rewritten_default
     assert f'href="{expected_default}/interpreter.css"' in rewritten_default
     assert "?v=" not in rewritten_default
@@ -940,7 +992,8 @@ async def test_my_booths_audio_controls_do_not_overflow_card(
                                 "mobile": False,
                             },
                         )
-                        nav = await send("Page.navigate", {"url": f"file://{html_file}"})
+                        html_uri = to_file_uri(html_file)
+                        nav = await send("Page.navigate", {"url": html_uri})
                         loader_id = nav.get("loaderId") if isinstance(nav, dict) else None
                         assert loader_id, f"Page.navigate did not return loaderId: {nav}"
                         await cdp.get_loader_event(loader_id).wait()
