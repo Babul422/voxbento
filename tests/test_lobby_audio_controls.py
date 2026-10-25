@@ -38,6 +38,48 @@ ROOT = Path(__file__).resolve().parent.parent / "portal"
 LOBBY_CSS = ROOT / "static" / "css" / "lobby.css"
 STATIC_CSS_DIR = ROOT / "static" / "css"
 
+REQUIRED_LOBBY_STYLESHEETS = [
+    "tokens.css",
+    "fonts.css",
+    "interpreter.css",
+    "account-area.css",
+    "app-header.css",
+    "lobby.css",
+]
+
+VERIFY_LOBBY_STYLES_SCRIPT = """(() => {
+    const inline = document.querySelector('.lobby-inline');
+    const select = document.querySelector('.lobby-select');
+    const btn = document.querySelector('.lobby-inline .aa-btn');
+    if (!inline || !select || !btn) {
+        return { ok: false, error: 'Required audio control elements not found' };
+    }
+    const csi = window.getComputedStyle(inline);
+    const css = window.getComputedStyle(select);
+    const csb = window.getComputedStyle(btn);
+
+    const issues = [];
+    if (csi.display !== 'flex') {
+        issues.push(`.lobby-inline display is '${csi.display}', expected 'flex'`);
+    }
+    if (css.minWidth !== '0px') {
+        issues.push(`.lobby-select min-width is '${css.minWidth}', expected '0px'`);
+    }
+    if (css.flexGrow !== '1') {
+        issues.push(`.lobby-select flex-grow is '${css.flexGrow}', expected '1'`);
+    }
+    if (css.flexBasis !== '0%' && css.flexBasis !== '0px') {
+        issues.push(`.lobby-select flex-basis is '${css.flexBasis}', expected '0%' or '0px'`);
+    }
+    if (csb.flexShrink !== '0') {
+        issues.push(`.lobby-inline .aa-btn flex-shrink is '${csb.flexShrink}', expected '0'`);
+    }
+    if (issues.length > 0) {
+        return { ok: false, error: issues.join('; ') };
+    }
+    return { ok: true };
+})()"""
+
 
 @pytest.fixture
 async def setup_db():
@@ -264,11 +306,35 @@ async def render_and_evaluate_webkit(
             try:
                 page = await browser.new_page(viewport={"width": viewport_width, "height": viewport_height})
                 await page.goto(f"file://{html_file}", wait_until="load")
+
+                # WebKit on Linux enforces strict cross-directory file:// security boundaries,
+                # blocking external <link rel="stylesheet"> files stored outside the HTML file's directory.
+                # Explicitly verify whether stylesheets were loaded; if blocked by the local file sandbox,
+                # inject the exact project stylesheets in order and re-verify required computed styles.
+                style_check = await page.evaluate(VERIFY_LOBBY_STYLES_SCRIPT)
+                if not style_check.get("ok"):
+                    for css_name in REQUIRED_LOBBY_STYLESHEETS:
+                        css_file = STATIC_CSS_DIR / css_name
+                        if not css_file.is_file():
+                            raise FileNotFoundError(f"Required project stylesheet not found: {css_file}")
+                        try:
+                            await page.add_style_tag(path=str(css_file))
+                        except Exception as e:
+                            raise RuntimeError(
+                                f"Failed to inject project stylesheet '{css_name}' into WebKit: {e}"
+                            ) from e
+
+                    style_check = await page.evaluate(VERIFY_LOBBY_STYLES_SCRIPT)
+                    if not style_check.get("ok"):
+                        raise RuntimeError(
+                            f"WebKit stylesheet verification failed after injection: {style_check.get('error')}"
+                        )
+
                 return await page.evaluate(build_geometry_eval_script(viewport_width))
             finally:
                 await browser.close()
 
-    # Otherwise WebKitWebDriver
+    # Otherwise WebKitWebDriver (alternative runner; note: unverified in environments without WebKitWebDriver installed)
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -309,6 +375,37 @@ async def render_and_evaluate_webkit(
                     f"/session/{session_id}/url",
                     json={"url": f"file://{html_file}"},
                 )
+                style_res = await http.post(
+                    f"/session/{session_id}/execute/sync",
+                    json={"script": f"return {VERIFY_LOBBY_STYLES_SCRIPT};", "args": []},
+                )
+                style_res.raise_for_status()
+                style_check = style_res.json().get("value", {})
+                if not style_check.get("ok"):
+                    for css_name in REQUIRED_LOBBY_STYLESHEETS:
+                        css_file = STATIC_CSS_DIR / css_name
+                        if not css_file.is_file():
+                            raise FileNotFoundError(f"Required project stylesheet not found: {css_file}")
+                        css_content = css_file.read_text(encoding="utf-8")
+                        inject_res = await http.post(
+                            f"/session/{session_id}/execute/sync",
+                            json={
+                                "script": "const s = document.createElement('style'); s.textContent = arguments[0]; document.head.appendChild(s);",
+                                "args": [css_content],
+                            },
+                        )
+                        inject_res.raise_for_status()
+                    style_res = await http.post(
+                        f"/session/{session_id}/execute/sync",
+                        json={"script": f"return {VERIFY_LOBBY_STYLES_SCRIPT};", "args": []},
+                    )
+                    style_res.raise_for_status()
+                    style_check = style_res.json().get("value", {})
+                    if not style_check.get("ok"):
+                        raise RuntimeError(
+                            f"WebKitWebDriver stylesheet verification failed after injection: {style_check.get('error')}"
+                        )
+
                 script = f"return {build_geometry_eval_script(viewport_width)};"
                 eval_res = await http.post(
                     f"/session/{session_id}/execute/sync",
@@ -587,6 +684,49 @@ async def test_find_webkit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.delenv("WEBKIT_PATH", raising=False)
 
 
+@pytest.mark.anyio
+async def test_verify_lobby_styles_script_validation():
+    """Verify VERIFY_LOBBY_STYLES_SCRIPT catches unstyled and malformed CSS and passes valid rules."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        try:
+            browser = await p.webkit.launch(headless=True)
+        except Exception as e:
+            if os.environ.get("CI"):
+                pytest.fail(f"Playwright WebKit required in CI but failed to launch: {e}")
+            pytest.skip("Playwright WebKit not available for style script unit test")
+        try:
+            page = await browser.new_page()
+            # 1. Elements missing
+            await page.set_content("<html><body></body></html>")
+            r_missing = await page.evaluate(VERIFY_LOBBY_STYLES_SCRIPT)
+            assert not r_missing["ok"]
+            assert "elements not found" in r_missing["error"]
+
+            # 2. Unstyled elements
+            await page.set_content(
+                '<html><body><div class="lobby-inline"><select class="lobby-select"></select><button class="aa-btn"></button></div></body></html>'
+            )
+            r_unstyled = await page.evaluate(VERIFY_LOBBY_STYLES_SCRIPT)
+            assert not r_unstyled["ok"]
+            assert "expected 'flex'" in r_unstyled["error"]
+
+            # 3. Correctly styled elements
+            await page.add_style_tag(
+                content=(
+                    ".lobby-inline { display: flex; gap: 8px; min-width: 0; } "
+                    ".lobby-select { flex: 1; min-width: 0; width: 0; } "
+                    ".lobby-inline .aa-btn { flex-shrink: 0; }"
+                )
+            )
+            r_styled = await page.evaluate(VERIFY_LOBBY_STYLES_SCRIPT)
+            assert r_styled["ok"], r_styled.get("error")
+        finally:
+            await browser.close()
+
+
+
 class _MockWS:
     def __init__(
         self,
@@ -804,6 +944,19 @@ async def test_my_booths_audio_controls_do_not_overflow_card(
                         loader_id = nav.get("loaderId") if isinstance(nav, dict) else None
                         assert loader_id, f"Page.navigate did not return loaderId: {nav}"
                         await cdp.get_loader_event(loader_id).wait()
+
+                        # Explicitly verify required CSS rules are active in Chrome
+                        style_res = await send(
+                            "Runtime.evaluate",
+                            {
+                                "expression": VERIFY_LOBBY_STYLES_SCRIPT,
+                                "returnByValue": True,
+                            },
+                        )
+                        style_check = style_res["result"]["value"]
+                        assert style_check.get("ok"), (
+                            f"Chrome stylesheet verification failed: {style_check.get('error')}"
+                        )
 
                         res = await send(
                             "Runtime.evaluate",
