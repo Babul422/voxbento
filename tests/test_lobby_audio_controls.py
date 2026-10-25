@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import urllib.request
@@ -72,6 +73,36 @@ def find_chrome() -> str | None:
     return None
 
 
+async def find_webkit() -> str | None:
+    """Find WebKit runner: returns 'playwright', or path to WebKitWebDriver, or None."""
+    env_webkit = os.environ.get("WEBKIT_BIN") or os.environ.get("WEBKIT_PATH")
+    if env_webkit and (os.path.exists(env_webkit) or shutil.which(env_webkit)):
+        return env_webkit
+
+    try:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            try:
+                path = p.webkit.executable_path
+                if path and os.path.exists(path):
+                    return "playwright"
+            except Exception:
+                pass
+    except (ImportError, Exception):
+        pass
+
+    for name in ("WebKitWebDriver", "/usr/bin/WebKitWebDriver"):
+        if name.startswith("/"):
+            if os.path.exists(name):
+                return name
+        else:
+            p = shutil.which(name)
+            if p:
+                return p
+    return None
+
+
 def parse_devtools_active_port(content: str) -> tuple[int, str] | None:
     """Parse DevToolsActivePort content into (port, ws_path), or None if incomplete/invalid."""
     lines = [line.strip() for line in content.splitlines() if line.strip()]
@@ -91,8 +122,9 @@ def parse_devtools_active_port(content: str) -> tuple[int, str] | None:
 async def wait_for_devtools_active_port(
     port_file: str | Path,
     proc: subprocess.Popen,
-    timeout: float = 5.0,
+    timeout: float = 15.0,
     poll_interval: float = 0.1,
+    stderr_file: str | Path | None = None,
 ) -> tuple[int, str]:
     """Poll until DevToolsActivePort can be read with a valid port and WebSocket path."""
     port_path = Path(port_file)
@@ -101,9 +133,17 @@ async def wait_for_devtools_active_port(
 
     while loop.time() < deadline:
         if proc.poll() is not None:
-            stdout, stderr = proc.communicate()
+            stderr_msg = ""
+            if stderr_file and os.path.exists(stderr_file):
+                try:
+                    stderr_msg = Path(stderr_file).read_text(encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    pass
+            elif hasattr(proc, "communicate"):
+                _, stderr = proc.communicate()
+                stderr_msg = stderr.decode(errors="replace").strip()
             raise RuntimeError(
-                f"Chrome exited prematurely (exit code {proc.returncode}): {stderr.decode(errors='replace')}"
+                f"Chrome exited prematurely (exit code {proc.returncode}): {stderr_msg}"
             )
         if port_path.exists():
             try:
@@ -115,12 +155,32 @@ async def wait_for_devtools_active_port(
                 pass
         await asyncio.sleep(poll_interval)
 
-    if proc.poll() is not None:
-        stdout, stderr = proc.communicate()
-        raise RuntimeError(
-            f"Chrome exited prematurely (exit code {proc.returncode}): {stderr.decode(errors='replace')}"
-        )
-    raise TimeoutError(f"Failed to read valid DevToolsActivePort from Chrome within {timeout}s timeout")
+    # Bounded timeout reached
+    stderr_msg = ""
+    if hasattr(proc, "terminate") and proc.poll() is None:
+        try:
+            proc.terminate()
+            if hasattr(proc, "wait"):
+                proc.wait(timeout=2)
+        except Exception:
+            if hasattr(proc, "kill"):
+                try:
+                    proc.kill()
+                    if hasattr(proc, "wait"):
+                        proc.wait(timeout=1)
+                except Exception:
+                    pass
+    if stderr_file and os.path.exists(stderr_file):
+        try:
+            stderr_msg = Path(stderr_file).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            pass
+    elif hasattr(proc, "communicate"):
+        _, stderr = proc.communicate()
+        stderr_msg = stderr.decode(errors="replace").strip()
+
+    err_suffix = f": {stderr_msg}" if stderr_msg else ""
+    raise TimeoutError(f"Failed to read valid DevToolsActivePort from Chrome within {timeout}s timeout{err_suffix}")
 
 
 def rewrite_css_links(html: str, static_dir: Path | PurePath | str = STATIC_CSS_DIR) -> str:
@@ -140,6 +200,132 @@ def rewrite_css_links(html: str, static_dir: Path | PurePath | str = STATIC_CSS_
         lambda m: f'href="{base_file_url}/{m.group(1)}"',
         html,
     )
+
+
+def build_geometry_eval_script(viewport_width: int) -> str:
+    """Generate JavaScript snippet to evaluate bounding-box layout metrics."""
+    return f"""(() => {{
+        const card = document.querySelector('.lobby-check');
+        const select = document.querySelector('#mic-device-select');
+        const btn = document.querySelector('#mic-test-btn');
+        if (!card || !select || !btn) {{
+            return {{ error: 'elements not found' }};
+        }}
+        const cr = card.getBoundingClientRect();
+        const sr = select.getBoundingClientRect();
+        const br = btn.getBoundingClientRect();
+        const vw = {viewport_width};
+        const selectedText = select.options[select.selectedIndex]?.text || '';
+        return {{
+            cardRight: cr.right,
+            cardWidth: cr.width,
+            selectLeft: sr.left,
+            selectRight: sr.right,
+            selectWidth: sr.width,
+            btnLeft: br.left,
+            btnRight: br.right,
+            btnWidth: br.width,
+            selectedText: selectedText,
+            hasLongLabel: selectedText.includes("Extremely Long"),
+            cardInsideViewport: cr.right <= vw + 0.5,
+            selectInsideCard: sr.left >= cr.left - 0.5 && sr.right <= cr.right + 0.5,
+            btnInsideCard: br.left >= cr.left - 0.5 && br.right <= cr.right + 0.5,
+            btnInsideViewport: br.right <= vw + 0.5,
+            btnToRightOfSelect: sr.right <= br.left + 0.5,
+            btnVisibleAndReadable: br.width >= 40
+        }};
+    }})()"""
+
+
+def assert_audio_controls_geometry(metrics: dict[str, Any]) -> None:
+    """Assert microphone controls remain within the card, within viewport, and do not overlap."""
+    assert "error" not in metrics, metrics.get("error")
+    assert metrics["hasLongLabel"], f"Long label not found in select: {metrics}"
+    assert metrics["cardInsideViewport"], f"Card expanded past viewport: {metrics}"
+    assert metrics["selectInsideCard"], f"Select overflows card: {metrics}"
+    assert metrics["btnInsideCard"], f"Test button overflows card: {metrics}"
+    assert metrics["btnInsideViewport"], f"Test button overflows viewport: {metrics}"
+    assert metrics["btnToRightOfSelect"], f"Test button overlaps select: {metrics}"
+    assert metrics["btnVisibleAndReadable"], f"Test button shrunk too small: {metrics}"
+
+
+async def render_and_evaluate_webkit(
+    webkit_runner: str,
+    html_file: str,
+    viewport_width: int,
+    viewport_height: int,
+) -> dict[str, Any]:
+    """Render fixture in WebKit and return geometry metrics."""
+    if webkit_runner == "playwright":
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.webkit.launch(headless=True)
+            try:
+                page = await browser.new_page(viewport={"width": viewport_width, "height": viewport_height})
+                await page.goto(f"file://{html_file}", wait_until="load")
+                return await page.evaluate(build_geometry_eval_script(viewport_width))
+            finally:
+                await browser.close()
+
+    # Otherwise WebKitWebDriver
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    proc = subprocess.Popen(
+        [webkit_runner, "-p", str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{port}"
+        async with AsyncClient(base_url=base_url, timeout=10.0) as http:
+            # Poll status
+            for _ in range(50):
+                if proc.poll() is not None:
+                    raise RuntimeError(f"WebKit driver exited prematurely with code {proc.returncode}")
+                try:
+                    res = await http.get("/status")
+                    if res.status_code == 200:
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.1)
+
+            session_res = await http.post(
+                "/session",
+                json={"capabilities": {"alwaysMatch": {}}},
+            )
+            session_res.raise_for_status()
+            session_id = session_res.json()["value"]["sessionId"]
+            try:
+                await http.post(
+                    f"/session/{session_id}/window/rect",
+                    json={"width": viewport_width, "height": viewport_height},
+                )
+                await http.post(
+                    f"/session/{session_id}/url",
+                    json={"url": f"file://{html_file}"},
+                )
+                script = f"return {build_geometry_eval_script(viewport_width)};"
+                eval_res = await http.post(
+                    f"/session/{session_id}/execute/sync",
+                    json={"script": script, "args": []},
+                )
+                eval_res.raise_for_status()
+                return eval_res.json()["value"]
+            finally:
+                await http.delete(f"/session/{session_id}")
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
 
 
 class CDPClient:
@@ -296,6 +482,15 @@ class _MockProc:
     def communicate(self) -> tuple[bytes, bytes]:
         return b"", self._stderr
 
+    def terminate(self) -> None:
+        pass
+
+    def kill(self) -> None:
+        pass
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        return self.returncode
+
 
 @pytest.mark.anyio
 async def test_wait_for_devtools_active_port_premature_exit():
@@ -347,6 +542,49 @@ def test_rewrite_css_links_windows_and_posix():
     )
     assert 'href="file:///C:/Users/runneradmin/app/portal/static/css/lobby.css"' in rewritten_win
     assert 'href="file:///C:/Users/runneradmin/app/portal/static/css/interpreter.css"' in rewritten_win
+
+
+def test_assert_audio_controls_geometry_valid():
+    valid_metrics = {
+        "hasLongLabel": True,
+        "cardInsideViewport": True,
+        "selectInsideCard": True,
+        "btnInsideCard": True,
+        "btnInsideViewport": True,
+        "btnToRightOfSelect": True,
+        "btnVisibleAndReadable": True,
+    }
+    assert_audio_controls_geometry(valid_metrics)
+
+
+def test_assert_audio_controls_geometry_failures():
+    base = {
+        "hasLongLabel": True,
+        "cardInsideViewport": True,
+        "selectInsideCard": True,
+        "btnInsideCard": True,
+        "btnInsideViewport": True,
+        "btnToRightOfSelect": True,
+        "btnVisibleAndReadable": True,
+    }
+    # Long label missing
+    with pytest.raises(AssertionError, match="Long label not found"):
+        assert_audio_controls_geometry({**base, "hasLongLabel": False})
+
+    # Button overflows card
+    with pytest.raises(AssertionError, match="Test button overflows card"):
+        assert_audio_controls_geometry({**base, "btnInsideCard": False})
+
+
+@pytest.mark.anyio
+async def test_find_webkit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    fake_driver = tmp_path / "fake_webkit_driver"
+    fake_driver.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    monkeypatch.setenv("WEBKIT_BIN", str(fake_driver))
+    assert await find_webkit() == str(fake_driver)
+
+    monkeypatch.delenv("WEBKIT_BIN", raising=False)
+    monkeypatch.delenv("WEBKIT_PATH", raising=False)
 
 
 class _MockWS:
@@ -451,12 +689,26 @@ async def test_cdp_client_ws_send_failure():
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("browser_engine", ["chrome", "webkit"])
 @pytest.mark.parametrize("viewport_width", [320, 360])
-async def test_my_booths_audio_controls_do_not_overflow_card(setup_db, viewport_width: int):
+async def test_my_booths_audio_controls_do_not_overflow_card(
+    setup_db, browser_engine: str, viewport_width: int
+):
     """Render the actual My booths page and verify audio controls stay inside the card."""
-    chrome = find_chrome()
-    if not chrome:
-        pytest.skip("Chrome/Chromium executable not found in environment")
+    if browser_engine == "chrome":
+        chrome = find_chrome()
+        if not chrome:
+            if os.environ.get("CI"):
+                pytest.fail("Chrome/Chromium executable required in CI but not found")
+            pytest.skip("Chrome/Chromium executable not found in environment")
+    elif browser_engine == "webkit":
+        webkit = await find_webkit()
+        if not webkit:
+            if os.environ.get("CI"):
+                pytest.fail("WebKit browser/driver (WebKitWebDriver or Playwright WebKit) required in CI but not found")
+            pytest.skip("WebKit browser/driver (WebKitWebDriver or Playwright WebKit) not found in environment")
+    else:
+        raise ValueError(f"Unknown browser engine: {browser_engine}")
 
     async with get_session() as s:
         event = await create_event(s, slug="summit", display_name="Summit 2026")
@@ -490,29 +742,41 @@ async def test_my_booths_audio_controls_do_not_overflow_card(setup_db, viewport_
         with open(html_file, "w", encoding="utf-8") as f:
             f.write(prepared_html)
 
+        if browser_engine == "webkit":
+            metrics = await render_and_evaluate_webkit(webkit, html_file, viewport_width, viewport_height)
+            assert_audio_controls_geometry(metrics)
+            return
+
+        # Chrome browser execution
         profile_dir = os.path.join(td, "chrome_profile")
         os.makedirs(profile_dir)
+        stderr_log = os.path.join(td, "chrome_stderr.log")
 
-        proc = subprocess.Popen(
-            [
-                chrome,
-                "--headless=new",
-                "--disable-gpu",
-                "--no-sandbox",
-                "--allow-file-access-from-files",
-                f"--user-data-dir={profile_dir}",
-                "--remote-debugging-port=0",
-                f"--window-size={viewport_width},{viewport_height}",
-                "about:blank",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        with open(stderr_log, "wb") as stderr_f:
+            proc = subprocess.Popen(
+                [
+                    chrome,
+                    "--headless=new",
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--allow-file-access-from-files",
+                    f"--user-data-dir={profile_dir}",
+                    "--remote-debugging-port=0",
+                    f"--window-size={viewport_width},{viewport_height}",
+                    "about:blank",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_f,
+            )
 
         try:
             port_file = os.path.join(profile_dir, "DevToolsActivePort")
             try:
-                port, _ = await wait_for_devtools_active_port(port_file, proc)
+                port, _ = await wait_for_devtools_active_port(
+                    port_file, proc, timeout=15.0, stderr_file=stderr_log
+                )
             except (RuntimeError, TimeoutError) as e:
                 pytest.fail(f"Chrome failed to start: {e}")
 
@@ -544,49 +808,12 @@ async def test_my_booths_audio_controls_do_not_overflow_card(setup_db, viewport_
                         res = await send(
                             "Runtime.evaluate",
                             {
-                                "expression": f"""(() => {{
-                                    const card = document.querySelector('.lobby-check');
-                                    const select = document.querySelector('#mic-device-select');
-                                    const btn = document.querySelector('#mic-test-btn');
-                                    if (!card || !select || !btn) {{
-                                        return {{ error: 'elements not found' }};
-                                    }}
-                                    const cr = card.getBoundingClientRect();
-                                    const sr = select.getBoundingClientRect();
-                                    const br = btn.getBoundingClientRect();
-                                    const vw = {viewport_width};
-                                    const selectedText = select.options[select.selectedIndex]?.text || '';
-                                    return {{
-                                        cardRight: cr.right,
-                                        cardWidth: cr.width,
-                                        selectLeft: sr.left,
-                                        selectRight: sr.right,
-                                        selectWidth: sr.width,
-                                        btnLeft: br.left,
-                                        btnRight: br.right,
-                                        btnWidth: br.width,
-                                        selectedText: selectedText,
-                                        hasLongLabel: selectedText.includes("Extremely Long"),
-                                        cardInsideViewport: cr.right <= vw + 0.5,
-                                        selectInsideCard: sr.left >= cr.left - 0.5 && sr.right <= cr.right + 0.5,
-                                        btnInsideCard: br.left >= cr.left - 0.5 && br.right <= cr.right + 0.5,
-                                        btnInsideViewport: br.right <= vw + 0.5,
-                                        btnToRightOfSelect: sr.right <= br.left + 0.5,
-                                        btnVisibleAndReadable: br.width >= 40
-                                    }};
-                                }})()""",
+                                "expression": build_geometry_eval_script(viewport_width),
                                 "returnByValue": True,
                             },
                         )
                         metrics = res["result"]["value"]
-                        assert "error" not in metrics, metrics.get("error")
-                        assert metrics["hasLongLabel"], f"Long label not found in select: {metrics}"
-                        assert metrics["cardInsideViewport"], f"Card expanded past viewport: {metrics}"
-                        assert metrics["selectInsideCard"], f"Select overflows card: {metrics}"
-                        assert metrics["btnInsideCard"], f"Test button overflows card: {metrics}"
-                        assert metrics["btnInsideViewport"], f"Test button overflows viewport: {metrics}"
-                        assert metrics["btnToRightOfSelect"], f"Test button overlaps select: {metrics}"
-                        assert metrics["btnVisibleAndReadable"], f"Test button shrunk too small: {metrics}"
+                        assert_audio_controls_geometry(metrics)
         finally:
             if proc.poll() is None:
                 proc.terminate()
