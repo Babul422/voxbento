@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -161,11 +162,71 @@ def parse_devtools_active_port(content: str) -> tuple[int, str] | None:
     return port, ws_path
 
 
+def terminate_process_tree(proc: subprocess.Popen | Any, timeout: float = 2.0) -> None:
+    """Terminate a process and all its children cleanly cross-platform without risking parent processes."""
+    if proc is None:
+        return
+
+    # Check if proc belongs to an isolated process group (e.g. spawned with start_new_session=True)
+    can_kill_group = False
+    pgid = None
+    if hasattr(proc, "pid") and isinstance(proc.pid, int) and proc.pid > 1:
+        if hasattr(os, "getpgid") and hasattr(os, "getpgrp") and hasattr(os, "killpg"):
+            try:
+                pgid = os.getpgid(proc.pid)
+                current_pgid = os.getpgrp()
+                # Ensure the process group is valid, distinct from the test runner, and led by proc
+                if pgid > 1 and pgid != current_pgid and pgid == proc.pid:
+                    can_kill_group = True
+            except (OSError, ProcessLookupError):
+                pass
+
+    # Graceful SIGTERM
+    try:
+        if can_kill_group and pgid is not None and hasattr(signal, "SIGTERM"):
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                if hasattr(proc, "terminate") and proc.poll() is None:
+                    proc.terminate()
+        elif hasattr(proc, "terminate") and proc.poll() is None:
+            proc.terminate()
+    except Exception:
+        pass
+
+    # Wait for process exit
+    try:
+        if hasattr(proc, "wait"):
+            proc.wait(timeout=timeout)
+    except Exception:
+        pass
+
+    # Force SIGKILL if still running
+    still_alive = proc.poll() is None if hasattr(proc, "poll") else False
+    if still_alive or can_kill_group:
+        try:
+            if can_kill_group and pgid is not None and hasattr(signal, "SIGKILL"):
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    if hasattr(proc, "kill") and still_alive:
+                        proc.kill()
+            elif hasattr(proc, "kill") and still_alive:
+                proc.kill()
+        except Exception:
+            pass
+        try:
+            if hasattr(proc, "wait"):
+                proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
+
 async def wait_for_devtools_active_port(
     port_file: str | Path,
     proc: subprocess.Popen,
     timeout: float = 15.0,
-    poll_interval: float = 0.1,
+    poll_interval: float = 0.05,
     stderr_file: str | Path | None = None,
 ) -> tuple[int, str]:
     """Poll until DevToolsActivePort can be read with a valid port and WebSocket path."""
@@ -174,6 +235,18 @@ async def wait_for_devtools_active_port(
     deadline = loop.time() + timeout
 
     while loop.time() < deadline:
+        # Check port file first: retry reading and parsing until valid, since the file
+        # can exist before its contents are fully written to disk.
+        if port_path.is_file():
+            try:
+                content = port_path.read_text(encoding="utf-8")
+                parsed = parse_devtools_active_port(content)
+                if parsed is not None:
+                    return parsed
+            except OSError:
+                pass
+
+        # Only treat process exit as fatal if the port file is still missing or invalid
         if proc.poll() is not None:
             stderr_msg = ""
             if stderr_file and os.path.exists(stderr_file):
@@ -193,31 +266,23 @@ async def wait_for_devtools_active_port(
             raise RuntimeError(
                 f"Chrome exited prematurely (exit code {proc.returncode}): {stderr_msg}"
             )
-        if port_path.exists():
-            try:
-                content = port_path.read_text(encoding="utf-8")
-                parsed = parse_devtools_active_port(content)
-                if parsed is not None:
-                    return parsed
-            except OSError:
-                pass
+
         await asyncio.sleep(poll_interval)
 
-    # Bounded timeout reached
-    stderr_msg = ""
-    if hasattr(proc, "terminate") and proc.poll() is None:
+    # One final check before giving up: the file may have been completed right at the deadline
+    if port_path.is_file():
         try:
-            proc.terminate()
-            if hasattr(proc, "wait"):
-                proc.wait(timeout=2)
-        except Exception:
-            if hasattr(proc, "kill"):
-                try:
-                    proc.kill()
-                    if hasattr(proc, "wait"):
-                        proc.wait(timeout=1)
-                except Exception:
-                    pass
+            content = port_path.read_text(encoding="utf-8")
+            parsed = parse_devtools_active_port(content)
+            if parsed is not None:
+                return parsed
+        except OSError:
+            pass
+
+    # Bounded timeout reached: ensure the process and any spawned children are terminated
+    terminate_process_tree(proc)
+
+    stderr_msg = ""
     if stderr_file and os.path.exists(stderr_file):
         try:
             stderr_msg = Path(stderr_file).read_text(encoding="utf-8", errors="replace").strip()
@@ -358,10 +423,16 @@ async def render_and_evaluate_webkit(
     port = sock.getsockname()[1]
     sock.close()
 
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+
     proc = subprocess.Popen(
         [webkit_runner, "-p", str(port)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        **popen_kwargs,
     )
     try:
         base_url = f"http://127.0.0.1:{port}"
@@ -435,13 +506,7 @@ async def render_and_evaluate_webkit(
             finally:
                 await http.delete(f"/session/{session_id}")
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2)
+        terminate_process_tree(proc)
 
 
 class CDPClient:
@@ -653,6 +718,58 @@ async def test_wait_for_devtools_active_port_success(tmp_path: Path):
     port, ws_path = await wait_for_devtools_active_port(port_file, mock_proc, timeout=1.0, poll_interval=0.01)
     assert port == 9876
     assert ws_path == "/devtools/browser/test-path"
+
+
+@pytest.mark.anyio
+async def test_wait_for_devtools_active_port_retry_partial_writes(tmp_path: Path):
+    mock_proc = _MockProc(returncode=None)
+    port_file = tmp_path / "DevToolsActivePort"
+    port_file.write_text("", encoding="utf-8")
+
+    async def update_file():
+        await asyncio.sleep(0.02)
+        port_file.write_text("5555\n", encoding="utf-8")
+        await asyncio.sleep(0.02)
+        port_file.write_text("5555\n/devtools/browser/retry-ws\n", encoding="utf-8")
+
+    asyncio.create_task(update_file())
+    port, ws_path = await wait_for_devtools_active_port(port_file, mock_proc, timeout=1.0, poll_interval=0.01)
+    assert port == 5555
+    assert ws_path == "/devtools/browser/retry-ws"
+
+
+def test_terminate_process_tree_mock():
+    class TrackingMockProc:
+        def __init__(self, pid=None):
+            self.pid = pid
+            self.terminated = False
+            self.killed = False
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = 0
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    # 1. Normal mock without pid
+    proc = TrackingMockProc()
+    terminate_process_tree(proc)
+    assert proc.terminated
+
+    # 2. Mock with parent test runner's pid: must NOT call killpg on test runner's group
+    current_pid = os.getpid()
+    proc_parent = TrackingMockProc(pid=current_pid)
+    terminate_process_tree(proc_parent)
+    assert proc_parent.terminated
 
 
 def test_to_file_uri_posix_and_windows(tmp_path: Path):
@@ -944,24 +1061,47 @@ async def test_my_booths_audio_controls_do_not_overflow_card(
         os.makedirs(profile_dir)
         stderr_log = os.path.join(td, "chrome_stderr.log")
 
+        chrome_cmd = [
+            chrome,
+            "--headless=new",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--allow-file-access-from-files",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--password-store=basic",
+            "--use-mock-keychain",
+            "--mute-audio",
+            "--disable-features=AudioServiceOutOfProcess",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-sync",
+            "--disable-extensions",
+            f"--user-data-dir={profile_dir}",
+            "--remote-debugging-port=0",
+            f"--window-size={viewport_width},{viewport_height}",
+            "about:blank",
+        ]
+        if os.name == "posix":
+            chrome_cmd.insert(6, "--no-zygote")
+
+        chrome_env = os.environ.copy()
+        # Suppress DBus connection attempts / timeouts in headless Linux environments
+        chrome_env.setdefault("DBUS_SESSION_BUS_ADDRESS", "/dev/null")
+
+        proc = None
         with open(stderr_log, "wb") as stderr_f:
-            proc = subprocess.Popen(
-                [
-                    chrome,
-                    "--headless=new",
-                    "--disable-gpu",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--allow-file-access-from-files",
-                    f"--user-data-dir={profile_dir}",
-                    "--remote-debugging-port=0",
-                    f"--window-size={viewport_width},{viewport_height}",
-                    "about:blank",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_f,
-            )
+            popen_kwargs: dict[str, Any] = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": stderr_f,
+                "env": chrome_env,
+            }
+            if os.name == "posix":
+                popen_kwargs["start_new_session"] = True
+
+            proc = subprocess.Popen(chrome_cmd, **popen_kwargs)
 
         try:
             port_file = os.path.join(profile_dir, "DevToolsActivePort")
@@ -1021,10 +1161,4 @@ async def test_my_booths_audio_controls_do_not_overflow_card(
                         metrics = res["result"]["value"]
                         assert_audio_controls_geometry(metrics)
         finally:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2)
+            terminate_process_tree(proc)
