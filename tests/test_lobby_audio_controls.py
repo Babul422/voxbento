@@ -11,7 +11,6 @@ import signal
 import socket
 import subprocess
 import tempfile
-import urllib.request
 from pathlib import Path, PurePath, PureWindowsPath
 from typing import Any
 
@@ -1112,8 +1111,9 @@ async def test_my_booths_audio_controls_do_not_overflow_card(
             except (RuntimeError, TimeoutError) as e:
                 pytest.fail(f"Chrome failed to start: {e}")
 
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=3) as r:
-                targets = json.load(r)
+            async with AsyncClient(timeout=3.0) as http_client:
+                targets_res = await http_client.get(f"http://127.0.0.1:{port}/json")
+                targets = targets_res.json()
             ws_url = [t for t in targets if t.get("type") == "page"][0]["webSocketDebuggerUrl"]
 
             async with asyncio.timeout(10.0):
