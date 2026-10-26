@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import re
 import secrets
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -1080,6 +1081,8 @@ async def redeem_auth_token(session: AsyncSession, jti: str, expected_type: str)
 # Transcripts
 # ---------------------------------------------------------------------------
 
+_TRANSCRIPT_LANGUAGE_CODE_RE = re.compile(r"^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$")
+
 
 async def save_transcript_segment(booth_id_str: str, text: str, room_id: int | None = None) -> int | None:
     """Save a finalized transcript segment to the database asynchronously and return its ID."""
@@ -1114,28 +1117,29 @@ async def save_transcript_segment(booth_id_str: str, text: str, room_id: int | N
 
             # 2. Canonical format: {event_slug}-{room_id}-{language_code}
             if parsed_room_id is None:
-                parts = booth_id_str.rsplit("-", 2)
-                if len(parts) == 3:
-                    cand_event_slug = parts[0]
-                    cand_room_str = parts[1]
-                    cand_lang = parts[2]
+                parts = booth_id_str.split("-")
+                for i in range(len(parts) - 2, 0, -1):
+                    cand_room_str = parts[i]
+                    if not (cand_room_str.isascii() and cand_room_str.isdigit()):
+                        continue
 
-                    # Validate that the room component is strictly ASCII digits
-                    if cand_room_str.isascii() and cand_room_str.isdigit():
-                        try:
-                            candidate_room_id = int(cand_room_str)
-                        except (ValueError, TypeError):
-                            candidate_room_id = None
-                    else:
-                        candidate_room_id = None
+                    try:
+                        candidate_room_id = int(cand_room_str)
+                    except (ValueError, TypeError):
+                        continue
+
+                    cand_event_slug = "-".join(parts[:i])
+                    cand_lang = "-".join(parts[i + 1 :])
 
                     if candidate_room_id is not None and cand_event_slug:
-                        if cand_lang == "floor" or (
-                            len(cand_lang) == 2 and cand_lang.isascii() and cand_lang.isalpha()
+                        if cand_lang.isascii() and (
+                            cand_lang == "floor"
+                            or (_TRANSCRIPT_LANGUAGE_CODE_RE.match(cand_lang) and len(cand_lang) <= 10)
                         ):
                             parsed_room_id = candidate_room_id
                             event_slug = cand_event_slug
                             language_code = cand_lang
+                            break
 
             if parsed_room_id is None or event_slug is None or language_code is None:
                 return None
@@ -1152,7 +1156,8 @@ async def save_transcript_segment(booth_id_str: str, text: str, room_id: int | N
                     )
                 )
                 booth_id = await session.scalar(stmt_booth)
-            else:
+
+            if booth_id is None:
                 stmt_room = (
                     select(Room.id)
                     .join(Event, Room.event_id == Event.id)
